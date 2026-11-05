@@ -8,9 +8,12 @@
 import Foundation
 
 /// API response for usage data
+///
+/// Every limit is optional: Claude has moved plans from a 5-hour session limit plus a weekly limit
+/// to weekly-only limits, so `five_hour` may be `null` or missing entirely.
 struct UsageAPIResponse: Codable {
-    let fiveHour: UsageLimitResponse
-    let sevenDay: UsageLimitResponse
+    let fiveHour: UsageLimitResponse?
+    let sevenDay: UsageLimitResponse?
     let sevenDaySonnet: UsageLimitResponse?
 
     enum CodingKeys: String, CodingKey {
@@ -22,7 +25,7 @@ struct UsageAPIResponse: Codable {
 
 /// Individual usage limit response from API
 struct UsageLimitResponse: Codable {
-    let utilization: Double // Percentage 0-100
+    let utilization: Double? // Percentage 0-100, can be null for inactive limits
     let resetsAt: String? // ISO8601 string, can be null
 
     enum CodingKeys: String, CodingKey {
@@ -49,62 +52,87 @@ enum MappingError: LocalizedError {
 /// Extension to map API response to domain model
 extension UsageAPIResponse {
     func toDomain() throws -> UsageData {
-        let iso8601Formatter = ISO8601DateFormatter()
-        iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        // Session (5-hour) limit is optional; plans with weekly-only limits omit it.
+        let sessionLimit = try fiveHour.flatMap { session -> UsageLimit? in
+            try makeLimit(
+                from: session,
+                field: "fiveHour.resetsAt",
+                fallback: Constants.Pacing.sessionWindow
+            )
+        }
 
-        let sessionResetDate = try parseResetDate(
-            from: fiveHour.resetsAt,
-            field: "fiveHour.resetsAt",
-            formatter: iso8601Formatter,
-            fallback: Constants.Pacing.sessionWindow
-        )
-        let weeklyResetDate = try parseResetDate(
-            from: sevenDay.resetsAt,
-            field: "sevenDay.resetsAt",
-            formatter: iso8601Formatter,
-            fallback: Constants.Pacing.weeklyWindow
-        )
-
-        // Handle optional sonnet usage
-        let sonnetLimit: UsageLimit? = try sevenDaySonnet.flatMap { sonnet -> UsageLimit? in
-            let sonnetResetDate = try parseResetDate(
-                from: sonnet.resetsAt,
-                field: "sevenDaySonnet.resetsAt",
-                formatter: iso8601Formatter,
+        let reportedWeeklyLimit = try sevenDay.flatMap { weekly -> UsageLimit? in
+            try makeLimit(
+                from: weekly,
+                field: "sevenDay.resetsAt",
                 fallback: Constants.Pacing.weeklyWindow
             )
-            return UsageLimit(
-                utilization: sonnet.utilization,
-                resetAt: sonnetResetDate
+        }
+
+        let weeklyLimit: UsageLimit
+        if let reportedWeeklyLimit {
+            weeklyLimit = reportedWeeklyLimit
+        } else if sessionLimit != nil {
+            // Session data present but no weekly data: treat weekly as unused.
+            weeklyLimit = UsageLimit(
+                utilization: 0,
+                resetAt: Date().addingTimeInterval(Constants.Pacing.weeklyWindow)
+            )
+        } else {
+            // No usable limit at all — nothing meaningful to display.
+            throw MappingError.missingCriticalField(field: "sevenDay")
+        }
+
+        let sonnetLimit = try sevenDaySonnet.flatMap { sonnet -> UsageLimit? in
+            try makeLimit(
+                from: sonnet,
+                field: "sevenDaySonnet.resetsAt",
+                fallback: Constants.Pacing.weeklyWindow
             )
         }
 
         return UsageData(
-            sessionUsage: UsageLimit(
-                utilization: fiveHour.utilization,
-                resetAt: sessionResetDate
-            ),
-            weeklyUsage: UsageLimit(
-                utilization: sevenDay.utilization,
-                resetAt: weeklyResetDate
-            ),
+            sessionUsage: sessionLimit,
+            weeklyUsage: weeklyLimit,
             sonnetUsage: sonnetLimit,
             lastUpdated: Date()
         )
     }
 
+    /// Builds a domain limit, or returns nil when the API reports the limit without a utilization value.
+    private func makeLimit(
+        from response: UsageLimitResponse,
+        field: String,
+        fallback: TimeInterval
+    ) throws -> UsageLimit? {
+        guard let utilization = response.utilization else {
+            return nil
+        }
+        let resetDate = try parseResetDate(from: response.resetsAt, field: field, fallback: fallback)
+        return UsageLimit(utilization: utilization, resetAt: resetDate)
+    }
+
     private func parseResetDate(
         from rawValue: String?,
         field: String,
-        formatter: ISO8601DateFormatter,
         fallback: TimeInterval
     ) throws -> Date {
         guard let rawValue else {
             return Date().addingTimeInterval(fallback)
         }
-        guard let date = formatter.date(from: rawValue) else {
-            throw MappingError.missingCriticalField(field: field)
+
+        let fractionalFormatter = ISO8601DateFormatter()
+        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractionalFormatter.date(from: rawValue) {
+            return date
         }
-        return date
+
+        let plainFormatter = ISO8601DateFormatter()
+        plainFormatter.formatOptions = [.withInternetDateTime]
+        if let date = plainFormatter.date(from: rawValue) {
+            return date
+        }
+
+        throw MappingError.missingCriticalField(field: field)
     }
 }

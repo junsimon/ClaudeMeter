@@ -9,8 +9,8 @@ import Foundation
 
 /// Complete usage data across all limit types
 struct UsageData: Codable, Equatable, Sendable {
-    /// 5-hour rolling session usage
-    let sessionUsage: UsageLimit
+    /// 5-hour rolling session usage (nil for plans with weekly-only limits)
+    let sessionUsage: UsageLimit?
 
     /// 7-day weekly usage across all models
     let weeklyUsage: UsageLimit
@@ -30,9 +30,15 @@ struct UsageData: Codable, Equatable, Sendable {
 }
 
 extension UsageData {
+    /// The limit that drives the menu bar icon and notifications:
+    /// the 5-hour session when the plan has one, otherwise the weekly limit.
+    var primaryUsage: UsageLimit {
+        sessionUsage ?? weeklyUsage
+    }
+
     /// Returns the primary usage level for menu bar display
     var primaryStatus: UsageStatus {
-        sessionUsage.status
+        primaryUsage.status
     }
 
     /// Human-readable staleness indicator
